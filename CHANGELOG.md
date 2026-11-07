@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.2] - 2026-11-07
+
+### Fixed
+- **命名的自定义 provider 无法被识别为"当前"**：网关给出的 provider slug 是带作用域的
+  `custom:gua`，而 config 里写的是 `custom`，精确比较会失败，导致
+  - 当前模型所在的那一行不打 `✓`；
+  - 标题里的"当前"退化成 `custom` 而不是真实名字 `gua`；
+  - 该 provider 在排序里可能掉到 OpenRouter 后面。
+  现在按「未作用域 slug 前缀」比较，并新增 `_resolve_current_item()` 把网关注入的
+  `(provider, model)` 映射回真实列表项（先同 provider 同模型 → 同模型任意 provider → 同 provider 任意模型）。
+- 排序改为优先使用适配器拿到的 `is_current` 标记，再退回 slug 匹配。
+
 ## [0.1.1] - 2026-11-07
 
 ### Fixed

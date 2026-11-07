@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/qqbot/adapter.py b/plugins/platforms/qqbot/adapter.py
-index 9d1dcd0ffa..de8dde1c0c 100644
+index 9d1dcd0ffa..514a581ce8 100644
 --- a/plugins/platforms/qqbot/adapter.py
 +++ b/plugins/platforms/qqbot/adapter.py
 @@ -72,8 +72,8 @@ from .chunked_upload import (
@@ -26,7 +26,7 @@ index 9d1dcd0ffa..de8dde1c0c 100644
          logger.debug("[%s] Unrecognised button_data %r from interaction %s", self._log_tag, button_data, event.id)
  
      @staticmethod
-@@ -1506,6 +1512,154 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+@@ -1506,6 +1512,183 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
              chat_id, content, build_update_prompt_keyboard(), reply_to=self._last_msg_id.get(chat_id)
          )
  
@@ -61,9 +61,14 @@ index 9d1dcd0ffa..de8dde1c0c 100644
 +        offering the current model, then the rest.
 +        """
 +        def rank(prov) -> int:
++            if prov.get("is_current"):
++                return 0
 +            slug = str(prov.get("slug") or "")
 +            models = [str(m) for m in (prov.get("models") or [])]
-+            if current_provider and slug == current_provider:
++            # A named custom provider is listed as "custom:gua" while config says
++            # "custom" — both name the same endpoint, so compare unscoped slugs too.
++            if current_provider and (slug == current_provider
++                                     or slug.split(":")[0] == current_provider.split(":")[0]):
 +                return 0
 +            if current_model and current_model in models:
 +                return 1
@@ -83,6 +88,31 @@ index 9d1dcd0ffa..de8dde1c0c 100644
 +                items.append((slug, label, model_id))
 +        return items
 +
++    @staticmethod
++    def _resolve_current_item(items, current_provider: str, current_model: str) -> tuple:
++        """Map the gateway's current route onto a picker item ``(slug, label, model)``.
++
++        ``current_provider`` comes from config ("custom") but the item slug of a named
++        custom provider is scoped ("custom:gua"); matching the exact slug alone would
++        leave the current row unmarked. Prefer the same model on the same provider,
++        then the same model anywhere, then the same provider with any model.
++        """
++        want = (current_provider or "").split(":")[0]
++
++        def same_provider(slug: str) -> bool:
++            return bool(want) and slug.split(":")[0] == want
++
++        for slug, label, model in items:
++            if model == current_model and (slug == current_provider or same_provider(slug)):
++                return slug, label, model
++        for slug, label, model in items:
++            if model == current_model:
++                return slug, label, model
++        for slug, label, _model in items:
++            if same_provider(slug):
++                return slug, label, current_model
++        return current_provider, current_provider or "?", current_model
++
 +    async def _send_model_picker_page(self, chat_id: str, key: str, page: int) -> SendResult:
 +        state = self._model_picker_store().get(key) or {}
 +        items = state.get("items") or []
@@ -93,12 +123,9 @@ index 9d1dcd0ffa..de8dde1c0c 100644
 +        page = max(0, min(int(page), total_pages - 1))
 +        state["page"] = page
 +        current_provider, current_model = state.get("current") or ("", "")
++        current_label = state.get("current_label") or current_provider or "?"
 +        start = page * size
 +        window = items[start:start + size]
-+        current_label = next(
-+            (prov_label for slug, prov_label, model in items
-+             if (slug, model) == (current_provider, current_model)),
-+            current_provider or "?")
 +
 +        # The legend carries the full provider + model id, because a QQ button label
 +        # is too narrow to fit both legibly; the buttons just carry the index.
@@ -126,9 +153,11 @@ index 9d1dcd0ffa..de8dde1c0c 100644
 +            if not items:
 +                return SendResult(success=False, error="no models to pick", retryable=False)
 +            key = session_key or chat_id
++            cur_slug, cur_label, cur_model = self._resolve_current_item(
++                items, current_provider, current_model)
 +            self._model_picker_store()[key] = {
 +                "items": items, "on_model_selected": on_model_selected, "chat_id": chat_id,
-+                "current": (current_provider, current_model), "page": 0,
++                "current": (cur_slug, cur_model), "current_label": cur_label, "page": 0,
 +            }
 +            return await self._send_model_picker_page(chat_id, key, 0)
 +        except Exception as exc:

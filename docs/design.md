@@ -100,9 +100,21 @@ QQ 官方机器人 inline keyboard 的硬限制：**最多 5 行**。按每行 5
 
 补丁里的排序键：
 
-1. `slug == current_provider` 的 provider（当前路由）→ 最前
-2. 模型列表里包含 `current_model` 的其它 provider
-3. 其余
+1. 适配器收到的 `is_current` 标记（网关自己算的，最可靠）
+2. `slug` 与 `current_provider` 相同，**比较时去掉作用域前缀**（config 里是 `custom`，
+   网关给命名自定义 provider 的 slug 是 `custom:gua`）
+3. 模型列表里包含 `current_model` 的其它 provider
+4. 其余
+
+### 4.1 当前项的解析（v0.1.2）
+
+`current_provider` 来自 config（`custom`），而列表项 slug 可能是 `custom:gua`，
+直接比较会让"当前模型"这一行不打 `✓`、标题显示成 `custom`。所以
+`_resolve_current_item()` 做三级回退：
+
+1. 同 provider（未作用域前缀相等）且模型相同
+2. 模型相同的任意 provider
+3. provider 匹配但模型不同（用网关给的模型 id 覆盖显示）
 
 供应商显示名的取法：优先 provider dict 的 `name`（`OpenRouter`、`Xiaomi MiMo`），
 没有才退回 `slug`；`name` 对自定义端点常常是描述性的（`Custom endpoint`），

@@ -1,0 +1,230 @@
+diff --git a/plugins/platforms/qqbot/adapter.py b/plugins/platforms/qqbot/adapter.py
+index 9d1dcd0ffa..e6fb87cd73 100644
+--- a/plugins/platforms/qqbot/adapter.py
++++ b/plugins/platforms/qqbot/adapter.py
+@@ -72,8 +72,8 @@ from .chunked_upload import (
+     ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError)
+ from .keyboards import (
+     ApprovalRequest, InlineKeyboard, InteractionEvent, build_approval_keyboard,
+-    build_update_prompt_keyboard, parse_approval_button_data, parse_interaction_event,
+-    parse_update_prompt_button_data)
++    build_model_picker_keyboard, build_update_prompt_keyboard, parse_approval_button_data,
++    parse_interaction_event, parse_model_pick_button_data, parse_update_prompt_button_data)
+ from gateway.platforms._shared import get_scoped_secret as _resolve_qq_secret
+ 
+ 
+@@ -720,6 +720,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+             self._write_update_response(update_answer, event.operator_openid)
+             return
+ 
++        model_pick = parse_model_pick_button_data(button_data)
++        if model_pick is not None:
++            kind, fields = model_pick
++            await self._handle_model_pick_interaction(event, kind, fields)
++            return
++
+         logger.debug("[%s] Unrecognised button_data %r from interaction %s", self._log_tag, button_data, event.id)
+ 
+     @staticmethod
+@@ -1506,6 +1512,129 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+             chat_id, content, build_update_prompt_keyboard(), reply_to=self._last_msg_id.get(chat_id)
+         )
+ 
++    # ── /model picker (cross-adapter contract: gateway calls send_model_picker) ──
++
++    _MODEL_PICKER_PAGE_SIZE = 8
++
++    def _model_picker_store(self) -> dict:
++        """Pending pickers keyed by session_key (one live picker per chat)."""
++        store = getattr(self, "_model_picker_pending", None)
++        if not isinstance(store, dict):
++            store = {}
++            self._model_picker_pending = store
++        return store
++
++    @staticmethod
++    def _model_picker_items(providers, current_provider: str = "", current_model: str = "") -> list:
++        """Flatten picker providers into ``(provider_slug, model_id, label)``.
++
++        The active provider comes first (QQ shows only one keyboard page at a time,
++        so a 58-model catalog must not bury the route in use), then any provider
++        offering the current model, then the rest.
++        """
++        def rank(prov) -> int:
++            slug = str(prov.get("slug") or "")
++            models = [str(m) for m in (prov.get("models") or [])]
++            if current_provider and slug == current_provider:
++                return 0
++            if current_model and current_model in models:
++                return 1
++            return 2
++
++        items: list = []
++        seen: set = set()
++        ordered = sorted(providers or [], key=rank)
++        for prov in ordered:
++            slug = str(prov.get("slug") or "")
++            for raw in (prov.get("models") or []):
++                model_id = str(raw)
++                key = (slug, model_id)
++                if key in seen:
++                    continue
++                seen.add(key)
++                label = model_id.split("/")[-1] if "/" in model_id else model_id
++                items.append((slug, model_id, label))
++        return items
++
++    async def _send_model_picker_page(self, chat_id: str, key: str, page: int) -> SendResult:
++        state = self._model_picker_store().get(key) or {}
++        items = state.get("items") or []
++        if not items:
++            return SendResult(success=False, error="no models to pick", retryable=False)
++        page = max(0, min(int(page), (len(items) - 1) // self._MODEL_PICKER_PAGE_SIZE))
++        state["page"] = page
++        current_provider, current_model = state.get("current") or ("", "")
++        shown = current_model.split("/")[-1] if current_model else "未知"
++        text = (f"🧠 **选择模型**\n\n当前：`{shown}`（{current_provider or '?'}）\n"
++                f"可选 {len(items)} 个，点下面的按钮切换：")
++        keyboard = build_model_picker_keyboard(
++            items, key, current=(current_provider, current_model),
++            page=page, page_size=self._MODEL_PICKER_PAGE_SIZE)
++        return await self.send_with_keyboard(chat_id, text, keyboard, reply_to=self._last_msg_id.get(chat_id))
++
++    async def send_model_picker(
++        self, chat_id: str, providers: list, current_model: str = "", current_provider: str = "",
++        session_key: str = "", on_model_selected=None, metadata: Optional[dict[str, Any]] = None,
++    ) -> SendResult:
++        """Inline-keyboard /model picker: tap a model button to switch (QQ 5-row keyboard limit)."""
++        del metadata
++        try:
++            items = self._model_picker_items(providers, current_provider, current_model)
++            if not items:
++                return SendResult(success=False, error="no models to pick", retryable=False)
++            key = session_key or chat_id
++            self._model_picker_store()[key] = {
++                "items": items, "on_model_selected": on_model_selected, "chat_id": chat_id,
++                "current": (current_provider, current_model), "page": 0,
++            }
++            return await self._send_model_picker_page(chat_id, key, 0)
++        except Exception as exc:
++            logger.error("[%s] send_model_picker failed: %s", self._log_tag, exc, exc_info=True)
++            return SendResult(success=False, error=str(exc) or type(exc).__name__)
++
++    async def _send_model_picker_notice(self, chat_id: str, text: str) -> None:
++        sender = self._text_sender(self._guess_chat_type(chat_id))
++        if sender is None:
++            return
++        try:
++            await sender(chat_id, text[: self.MAX_MESSAGE_LENGTH], self._last_msg_id.get(chat_id))
++        except Exception as exc:
++            logger.warning("[%s] model picker notice failed: %s", self._log_tag, exc)
++
++    async def _handle_model_pick_interaction(self, event: InteractionEvent, kind: str,
++                                             fields: tuple) -> None:
++        """Dispatch a /model picker button click: select / page / cancel."""
++        session_key = fields[-1]
++        store = self._model_picker_store()
++        state = store.get(session_key)
++        if state is None:
++            logger.info("[%s] Model picker state gone for session %s", self._log_tag, session_key)
++            return
++        if not self._is_authorized_interaction_for_session(event, session_key):
++            logger.warning("[%s] Rejected unauthorized model pick for session %s (operator=%s)",
++                           self._log_tag, session_key, event.operator_openid)
++            return
++        chat_id = state.get("chat_id") or event.user_openid
++        if kind == "x":
++            store.pop(session_key, None)
++            await self._send_model_picker_notice(chat_id, "已取消模型切换。")
++            return
++        if kind == "p":
++            await self._send_model_picker_page(chat_id, session_key, int(fields[0]))
++            return
++        provider, model = fields[0], fields[1]
++        callback = state.get("on_model_selected")
++        store.pop(session_key, None)
++        if callback is None:
++            await self._send_model_picker_notice(chat_id, "选择器已失效，请重新发送 /model。")
++            return
++        try:
++            reply = await callback(chat_id, model, provider)
++        except Exception as exc:
++            logger.error("[%s] Model picker switch failed: %s", self._log_tag, exc, exc_info=True)
++            reply = f"❌ 切换模型失败：{exc}"
++        await self._send_model_picker_notice(chat_id, reply or "✅ 已切换模型。")
++
+     def _build_text_body(self, content: str, reply_to: Optional[str] = None) -> dict[str, Any]:
+         msg_seq = self._next_msg_seq(reply_to or "default")
+         text = content[: self.MAX_MESSAGE_LENGTH]
+diff --git a/plugins/platforms/qqbot/keyboards.py b/plugins/platforms/qqbot/keyboards.py
+index 46ab7a83bc..e1deec1c8a 100644
+--- a/plugins/platforms/qqbot/keyboards.py
++++ b/plugins/platforms/qqbot/keyboards.py
+@@ -189,3 +189,67 @@ def parse_interaction_event(raw: dict[str, Any]) -> InteractionEvent:
+         channel_id=str(raw.get("channel_id", "")), guild_id=str(raw.get("guild_id", "")),
+         button_data=str(resolved.get("button_data", "")), button_id=str(resolved.get("button_id", "")),
+         resolver_user_id=str(resolved.get("user_id", "")))
++
++
++# ── /model picker ────────────────────────────────────────────────────────────
++MODEL_PICK_PREFIX = "model_pick:"
++_MODEL_PICK_RE = re.compile(r"^model_pick:([mpx])\|(.+)$")
++
++
++def parse_model_pick_button_data(button_data: str) -> Optional[tuple[str, tuple[str, ...]]]:
++    """Parse a /model picker ``button_data`` into ``(kind, fields)``.
++
++    Kinds: ``m`` select → ``("m", (provider, model, session_key))``;
++    ``p`` page → ``("p", (page, session_key))``; ``x`` cancel → ``("x", (session_key,))``.
++    """
++    m = _MODEL_PICK_RE.match(button_data or "")
++    if not m:
++        return None
++    kind, rest = m.group(1), m.group(2)
++    parts = tuple(rest.split("|"))
++    if kind == "m" and len(parts) == 3:
++        return kind, parts
++    if kind == "p" and len(parts) == 2 and parts[0].isdigit():
++        return kind, parts
++    if kind == "x" and len(parts) == 1:
++        return kind, parts
++    return None
++
++
++def _model_pick_button(btn_id: str, label: str, data: str, *, style: int = 1,
++                       visited: str = "已选择") -> KeyboardButton:
++    return KeyboardButton(
++        id=btn_id, group_id="model_pick",
++        action=KeyboardButtonAction(type=1, data=data),
++        render_data=KeyboardButtonRenderData(label=label, visited_label=visited, style=style))
++
++
++def build_model_picker_keyboard(items: list, session_key: str, *, current: tuple = ("", ""),
++                                page: int = 0, page_size: int = 8) -> InlineKeyboard:
++    """Build the /model picker keyboard.
++
++    QQ allows at most 5 rows per keyboard, so a page shows ``page_size`` models at
++    two per row plus one action row (``下一页`` when more remain, always ``取消``).
++    *items* holds ``(provider_slug, model_id, label)`` triples.
++    """
++    start = page * page_size
++    window = items[start:start + page_size]
++    rows: list[KeyboardRow] = []
++    for i in range(0, len(window), 2):
++        buttons = []
++        for offset, (provider, model, label) in enumerate(window[i:i + 2]):
++            idx = start + i + offset
++            is_current = (provider, model) == (current[0], current[1])
++            text = ("✓ " if is_current else "") + label
++            data = f"{MODEL_PICK_PREFIX}m|{provider}|{model}|{session_key}"
++            buttons.append(_model_pick_button(f"m{idx}", text[:24], data))
++        rows.append(KeyboardRow(buttons=buttons))
++    actions = []
++    if start + page_size < len(items):
++        actions.append(_model_pick_button(
++            "next", "下一页 ▸", f"{MODEL_PICK_PREFIX}p|{page + 1}|{session_key}",
++            style=1, visited="下一页"))
++    actions.append(_model_pick_button(
++        "cancel", "取消", f"{MODEL_PICK_PREFIX}x|{session_key}", style=0, visited="已取消"))
++    rows.append(KeyboardRow(buttons=actions))
++    return InlineKeyboard(content=KeyboardContent(rows=rows[:5]))

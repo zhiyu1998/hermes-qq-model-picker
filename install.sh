@@ -108,11 +108,14 @@ build_model_picker_keyboard = mod.build_model_picker_keyboard
 parse_model_pick_button_data = mod.parse_model_pick_button_data
 
 sk = "agent:main:qqbot:c2c:SELFTEST"
-items = [("custom", "deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-1017"),
-         ("openrouter", "anthropic/claude-fable-5.1", "claude-fable-5.1")]
+items = [("custom", "Custom endpoint", "deepseek-v4.1-flash-1017"),
+         ("openrouter", "OpenRouter", "anthropic/claude-fable-5.1")]
 rows = build_model_picker_keyboard(items, sk, current=("custom", "deepseek-v4.1-flash-1017")).to_dict()["content"]["rows"]
 assert rows, "empty keyboard"
 assert len(rows) <= 5, "keyboard must fit QQ's 5-row limit"
+labels = [b["render_data"]["label"] for b in rows[0]["buttons"]]
+assert labels and labels[0].startswith("✓1."), "first button should be the numbered current model: %r" % (labels,)
+assert len(labels[0]) <= 20, "button label exceeds the 20-char budget: %r" % (labels[0],)
 parsed = parse_model_pick_button_data(rows[0]["buttons"][0]["action"]["data"])
 assert parsed and parsed[0] == "m", "button_data round-trip failed: %r" % (parsed,)
 

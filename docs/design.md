@@ -59,17 +59,39 @@ QQ 官方机器人 inline keyboard 的硬限制：**最多 5 行**。按每行 5
 但模型名很长，5 个一行会被截断到看不懂，所以采用 **2 个/行**：
 
 ```text
-行1  [ 模型1 ] [ 模型2 ]
-行2  [ 模型3 ] [ 模型4 ]
-行3  [ 模型5 ] [ 模型6 ]
-行4  [ 模型7 ] [ 模型8 ]
+行1  [ 1. 模型A ] [ 2. 模型B ]
+行2  [ 3. 模型C ] [ 4. 模型D ]
+行3  [ 5. 模型E ] [ 6. 模型F ]
+行4  [ 7. 模型G ] [ 8. 模型H ]
 行5  [ 下一页 ▸ ] [ 取消 ]        ← 最后一页只有 [ 取消 ]
 ```
 
 - 一页 8 个模型（`_MODEL_PICKER_PAGE_SIZE = 8`），可在 `adapter.py` 里调整；
-- 按钮标签：取模型 id 的最后一段（`anthropic/claude-fable-5.1` → `claude-fable-5.1`），截断到 24 字符；
-- 当前模型加 `✓` 前缀；
 - 所有按钮共享 `group_id="model_pick"`，配合 `click_limit=1` 实现"点一次即置灰"。
+
+### 3.1 供应商写在哪里（v0.1.1 改进）
+
+第一版按钮直接放 `供应商 · 模型`，实测发现**更糟**：QQ 按钮文案宽度按 20 字符排版，
+`OpenRouter · claude-fable-5.1` 会被截成 `OpenRouter · claude-fab…`，
+而同环境的 `claude-fable-5` 和 `claude-fable-5.1` 截断后**显示完全一样**，等于没法选。
+
+所以改成 **编号 + 正文图例**：
+
+```text
+🧠 选择模型（第 1/2 页）
+
+当前：Custom endpoint · `deepseek-v4.1-flash-1017`
+
+1. Custom endpoint · `deepseek-v4.1-flash-1017` ✓
+2. OpenRouter · `anthropic/claude-fable-5.1`
+3. OpenRouter · `anthropic/claude-fable-5`
+...
+点下面的数字按钮切换：
+```
+
+- 正文图例：`序号. 供应商 · 完整模型 ID`，当前项加 `✓`；
+- 按钮：`序号. 模型短名`（短名超长才截断，且保留尾部差异靠图例区分），当前项前缀 `✓`；
+- 序号是**全量列表里的全局序号**（第 2 页从 9 开始），图例与按钮一一对应；
 
 ## 4. 排序：为什么必须把当前 provider 排前面
 
@@ -82,8 +104,13 @@ QQ 官方机器人 inline keyboard 的硬限制：**最多 5 行**。按每行 5
 2. 模型列表里包含 `current_model` 的其它 provider
 3. 其余
 
+供应商显示名的取法：优先 provider dict 的 `name`（`OpenRouter`、`Xiaomi MiMo`），
+没有才退回 `slug`；`name` 对自定义端点常常是描述性的（`Custom endpoint`），
+按需求保留原样显示在正文图例里。
+
 实测（某真实环境）：OpenRouter 58 个 + xiaomi 8 个 + custom 1 个 = 71 个模型，
-排序后第一屏第一个按钮就是 `✓ deepseek-v4.1-flash-1017`。
+排序后第一屏第一个按钮就是 `✓1. deepseek-v4.1-f…`，正文第一行就是
+`1. Custom endpoint · deepseek-v4.1-flash-1017 ✓`。
 
 ## 5. 按钮数据格式
 

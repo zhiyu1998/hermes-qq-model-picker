@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/qqbot/adapter.py b/plugins/platforms/qqbot/adapter.py
-index 9d1dcd0ffa..e6fb87cd73 100644
+index 9d1dcd0ffa..de8dde1c0c 100644
 --- a/plugins/platforms/qqbot/adapter.py
 +++ b/plugins/platforms/qqbot/adapter.py
 @@ -72,8 +72,8 @@ from .chunked_upload import (
@@ -26,7 +26,7 @@ index 9d1dcd0ffa..e6fb87cd73 100644
          logger.debug("[%s] Unrecognised button_data %r from interaction %s", self._log_tag, button_data, event.id)
  
      @staticmethod
-@@ -1506,6 +1512,129 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+@@ -1506,6 +1512,154 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
              chat_id, content, build_update_prompt_keyboard(), reply_to=self._last_msg_id.get(chat_id)
          )
  
@@ -42,9 +42,19 @@ index 9d1dcd0ffa..e6fb87cd73 100644
 +            self._model_picker_pending = store
 +        return store
 +
++    _MODEL_BUTTON_LABEL_MAX = 20
++
++    @staticmethod
++    def _provider_label(prov) -> str:
++        """Human-readable provider label ("OpenRouter", "Xiaomi MiMo", "custom")."""
++        name = str(prov.get("name") or "").strip()
++        if name:
++            return name.split("(")[0].strip() or name
++        return str(prov.get("slug") or "").strip() or "?"
++
 +    @staticmethod
 +    def _model_picker_items(providers, current_provider: str = "", current_model: str = "") -> list:
-+        """Flatten picker providers into ``(provider_slug, model_id, label)``.
++        """Flatten picker providers into ``(provider_slug, provider_label, model_id)``.
 +
 +        The active provider comes first (QQ shows only one keyboard page at a time,
 +        so a 58-model catalog must not bury the route in use), then any provider
@@ -61,17 +71,16 @@ index 9d1dcd0ffa..e6fb87cd73 100644
 +
 +        items: list = []
 +        seen: set = set()
-+        ordered = sorted(providers or [], key=rank)
-+        for prov in ordered:
++        for prov in sorted(providers or [], key=rank):
 +            slug = str(prov.get("slug") or "")
++            label = QQAdapter._provider_label(prov)
 +            for raw in (prov.get("models") or []):
 +                model_id = str(raw)
 +                key = (slug, model_id)
 +                if key in seen:
 +                    continue
 +                seen.add(key)
-+                label = model_id.split("/")[-1] if "/" in model_id else model_id
-+                items.append((slug, model_id, label))
++                items.append((slug, label, model_id))
 +        return items
 +
 +    async def _send_model_picker_page(self, chat_id: str, key: str, page: int) -> SendResult:
@@ -79,15 +88,31 @@ index 9d1dcd0ffa..e6fb87cd73 100644
 +        items = state.get("items") or []
 +        if not items:
 +            return SendResult(success=False, error="no models to pick", retryable=False)
-+        page = max(0, min(int(page), (len(items) - 1) // self._MODEL_PICKER_PAGE_SIZE))
++        size = self._MODEL_PICKER_PAGE_SIZE
++        total_pages = max(1, (len(items) + size - 1) // size)
++        page = max(0, min(int(page), total_pages - 1))
 +        state["page"] = page
 +        current_provider, current_model = state.get("current") or ("", "")
-+        shown = current_model.split("/")[-1] if current_model else "未知"
-+        text = (f"🧠 **选择模型**\n\n当前：`{shown}`（{current_provider or '?'}）\n"
-+                f"可选 {len(items)} 个，点下面的按钮切换：")
++        start = page * size
++        window = items[start:start + size]
++        current_label = next(
++            (prov_label for slug, prov_label, model in items
++             if (slug, model) == (current_provider, current_model)),
++            current_provider or "?")
++
++        # The legend carries the full provider + model id, because a QQ button label
++        # is too narrow to fit both legibly; the buttons just carry the index.
++        lines = [f"🧠 **选择模型**（第 {page + 1}/{total_pages} 页）", "",
++                 f"当前：{current_label} · `{current_model or '未知'}`", ""]
++        for offset, (slug, prov_label, model_id) in enumerate(window):
++            mark = " ✓" if (slug, model_id) == (current_provider, current_model) else ""
++            lines.append(f"{start + offset + 1}. {prov_label} · `{model_id}`{mark}")
++        lines += ["", "点下面的数字按钮切换："]
++        text = "\n".join(lines)
++
 +        keyboard = build_model_picker_keyboard(
 +            items, key, current=(current_provider, current_model),
-+            page=page, page_size=self._MODEL_PICKER_PAGE_SIZE)
++            page=page, page_size=size)
 +        return await self.send_with_keyboard(chat_id, text, keyboard, reply_to=self._last_msg_id.get(chat_id))
 +
 +    async def send_model_picker(
@@ -157,10 +182,10 @@ index 9d1dcd0ffa..e6fb87cd73 100644
          msg_seq = self._next_msg_seq(reply_to or "default")
          text = content[: self.MAX_MESSAGE_LENGTH]
 diff --git a/plugins/platforms/qqbot/keyboards.py b/plugins/platforms/qqbot/keyboards.py
-index 46ab7a83bc..e1deec1c8a 100644
+index 46ab7a83bc..b3135a7567 100644
 --- a/plugins/platforms/qqbot/keyboards.py
 +++ b/plugins/platforms/qqbot/keyboards.py
-@@ -189,3 +189,67 @@ def parse_interaction_event(raw: dict[str, Any]) -> InteractionEvent:
+@@ -189,3 +189,78 @@ def parse_interaction_event(raw: dict[str, Any]) -> InteractionEvent:
          channel_id=str(raw.get("channel_id", "")), guild_id=str(raw.get("guild_id", "")),
          button_data=str(resolved.get("button_data", "")), button_id=str(resolved.get("button_id", "")),
          resolver_user_id=str(resolved.get("user_id", "")))
@@ -168,6 +193,7 @@ index 46ab7a83bc..e1deec1c8a 100644
 +
 +# ── /model picker ────────────────────────────────────────────────────────────
 +MODEL_PICK_PREFIX = "model_pick:"
++_MODEL_LABEL_MAX = 20  # QQ inline-keyboard button label limit
 +_MODEL_PICK_RE = re.compile(r"^model_pick:([mpx])\|(.+)$")
 +
 +
@@ -205,19 +231,29 @@ index 46ab7a83bc..e1deec1c8a 100644
 +
 +    QQ allows at most 5 rows per keyboard, so a page shows ``page_size`` models at
 +    two per row plus one action row (``下一页`` when more remain, always ``取消``).
-+    *items* holds ``(provider_slug, model_id, label)`` triples.
++    *items* holds ``(provider_slug, provider_label, model_id)`` triples.
++
++    A button label is narrow, so it carries only ``<index>. <short model>`` — the
++    message body renders the full ``provider · model`` legend for those indexes.
 +    """
 +    start = page * page_size
 +    window = items[start:start + page_size]
 +    rows: list[KeyboardRow] = []
 +    for i in range(0, len(window), 2):
 +        buttons = []
-+        for offset, (provider, model, label) in enumerate(window[i:i + 2]):
++        for offset, (provider, _provider_label, model) in enumerate(window[i:i + 2]):
 +            idx = start + i + offset
 +            is_current = (provider, model) == (current[0], current[1])
-+            text = ("✓ " if is_current else "") + label
++            number = str(idx + 1)
++            budget = _MODEL_LABEL_MAX - len(number) - 2 - (1 if is_current else 0)  # "12. " (+"✓")
++            short = model.split("/")[-1] if "/" in model else model
++            if len(short) > budget:
++                short = short[:max(budget - 1, 4)] + "…"
++            label = f"{number}. {short}"
++            if is_current:
++                label = "✓" + label
 +            data = f"{MODEL_PICK_PREFIX}m|{provider}|{model}|{session_key}"
-+            buttons.append(_model_pick_button(f"m{idx}", text[:24], data))
++            buttons.append(_model_pick_button(f"m{idx}", label[:_MODEL_LABEL_MAX], data))
 +        rows.append(KeyboardRow(buttons=buttons))
 +    actions = []
 +    if start + page_size < len(items):

@@ -133,3 +133,29 @@ MIT — 见 [LICENSE](LICENSE)。
 
 本项目只包含**补丁与安装脚本**，不包含 Hermes Agent 的任何源码；
 Hermes Agent 本身遵循其上游仓库的许可证。
+
+---
+
+## English summary
+
+Hermes Agent's `/model` command only shows an interactive picker on platforms whose
+adapter implements `send_model_picker` — currently Telegram, Discord, Slack and Matrix.
+On QQ the command falls back to a plain text list, forcing users to type
+`/model <model> --provider <slug>`.
+
+The QQ Bot plugin already ships a complete inline-keyboard implementation (used by the
+approval buttons), so this repo adds the missing picker:
+
+- 8 models per page (QQ allows at most 5 keyboard rows) + `下一页` / `取消`
+- current model marked with `✓`, and the **active provider's models sorted first**
+  (otherwise a 58-model OpenRouter catalog pushes your own model to page 7)
+- `click_limit=1` so a tapped button greys out; clicks are authorized against the
+  session key so other members of the group cannot switch your model
+- any failure returns `success=False` so Hermes falls back to the old text list
+
+Install: `./install.sh --restart` (apply patch + self-check + restart gateway).
+Uninstall: `./uninstall.sh --restart`.
+
+Note: the patch touches files inside the hermes-agent checkout, so `hermes update`
+overwrites it — re-run `./install.sh` after an upgrade.
+

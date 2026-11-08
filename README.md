@@ -1,5 +1,7 @@
 # hermes-qq-model-picker
 
+**中文** | [English](README.en.md)
+
 > 给 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 **QQ 机器人**补上 `/model` 的**可点击模型选择器**。
 
 在 QQ 里发 `/model`，不再是"给你一段文字列表、然后自己手打 `/model <model> --provider <slug>`"，
@@ -155,34 +157,3 @@ MIT — 见 [LICENSE](LICENSE)。
 
 本项目只包含**补丁与安装脚本**，不包含 Hermes Agent 的任何源码；
 Hermes Agent 本身遵循其上游仓库的许可证。
-
----
-
-## English summary
-
-Hermes Agent's `/model` command only shows an interactive picker on platforms whose
-adapter implements `send_model_picker` — currently Telegram, Discord, Slack and Matrix.
-On QQ the command falls back to a plain text list, forcing users to type
-`/model <model> --provider <slug>`.
-
-The QQ Bot plugin already ships a complete inline-keyboard implementation (used by the
-approval buttons), so this repo adds the missing picker:
-
-- 8 models per page (QQ allows at most 5 keyboard rows) + `下一页` / `取消`
-- **every entry shows its provider**: the message body renders a numbered legend
-  (`1. Custom endpoint · deepseek-v4.1-flash-1017`), and the buttons carry the same
-  global index (`1.`–`8.`, continuing across pages). Putting `provider · model` on
-  the button itself does not fit QQ's ~20-char label width and made
-  `claude-fable-5` / `claude-fable-5.1` render identically.
-- current model marked with `✓`, and the **active provider's models sorted first**
-  (otherwise a 58-model OpenRouter catalog pushes your own model to page 7)
-- `click_limit=1` so a tapped button greys out; clicks are authorized against the
-  session key so other members of the group cannot switch your model
-- any failure returns `success=False` so Hermes falls back to the old text list
-
-Install: `./install.sh --restart` (apply patch + self-check + restart gateway).
-Uninstall: `./uninstall.sh --restart`.
-
-Note: the patch touches files inside the hermes-agent checkout, so `hermes update`
-overwrites it — re-run `./install.sh` after an upgrade.
-

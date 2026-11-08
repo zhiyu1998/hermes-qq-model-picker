@@ -3,6 +3,9 @@
 **中文** | [English](README.en.md)
 
 > 给 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 **QQ 机器人**补上 `/model` 的**可点击模型选择器**。
+>
+> 支持 **v0.18.x**（插件在 `gateway/platforms/qqbot/`）与 **v0.20+**（插件在 `plugins/platforms/qqbot/`），
+> 安装脚本会自动识别布局并选用对应补丁。
 
 在 QQ 里发 `/model`，不再是"给你一段文字列表、然后自己手打 `/model <model> --provider <slug>`"，
 而是直接弹出一张**带按钮的卡片**：点一下就切模型，当前模型带 ✓，支持翻页和取消，
@@ -69,6 +72,13 @@ QQ 官方机器人 API 其实**支持 inline keyboard**，插件里也已经有�
 
 ## 安装
 
+`install.sh` 会先探测 QQ 插件目录，自动挑对应的补丁，**新旧版本都能装**：
+
+| 探测到的目录 | 使用的补丁 | 对应 Hermes |
+|---|---|---|
+| `plugins/platforms/qqbot/` | `patches/qqbot-model-picker.patch` | 新版（v0.20+，含 v0.23.0） |
+| `gateway/platforms/qqbot/` | `patches/qqbot-model-picker-legacy.patch` | 旧版（v0.18.x 及更早） |
+
 ### 方式一：一键（已 clone 本仓库）
 
 ```bash
@@ -78,11 +88,24 @@ cd hermes-qq-model-picker
 ./install.sh --restart       # 打补丁 + 重启网关
 ```
 
+脚本会打印它识别到的布局与补丁，例如：
+
+```text
+= layout: gateway/platforms/qqbot
+= patch:  patches/qqbot-model-picker-legacy.patch
+```
+
 ### 方式二：手动
 
 ```bash
 cd ~/.hermes/hermes-agent
+
+# 新版（插件在 plugins/platforms/qqbot/）
 git apply /path/to/patches/qqbot-model-picker.patch
+
+# 旧版（插件在 gateway/platforms/qqbot/）
+git apply /path/to/patches/qqbot-model-picker-legacy.patch
+
 hermes gateway restart        # 或: systemctl --user restart hermes-gateway.service
 ```
 
@@ -93,8 +116,12 @@ Windows 上 Hermes 的安装目录通常是 `%USERPROFILE%\.hermes\hermes-agent`
 
 ```bash
 cd ~/.hermes/hermes-agent
+
+# 新版
 venv/bin/python -c "from plugins.platforms.qqbot.adapter import QQAdapter; print(hasattr(QQAdapter,'send_model_picker'))"
-# 期望输出 True
+# 旧版
+venv/bin/python -c "from gateway.platforms.qqbot.adapter import QQAdapter; print(hasattr(QQAdapter,'send_model_picker'))"
+# 期望都是 True
 ```
 
 然后在 QQ 里发 `/model`，应该直接收到带按钮的卡片。
@@ -102,7 +129,7 @@ venv/bin/python -c "from plugins.platforms.qqbot.adapter import QQAdapter; print
 ## 卸载 / 回滚
 
 ```bash
-./uninstall.sh              # git checkout 还原两个文件
+./uninstall.sh              # git checkout 还原两个文件（同样自动识别布局）
 ./uninstall.sh --restart    # 还原并重启网关
 ```
 
@@ -111,20 +138,34 @@ venv/bin/python -c "from plugins.platforms.qqbot.adapter import QQAdapter; print
 补丁改的是 hermes-agent **仓库里的插件文件**，`hermes update` 会用上游版本覆盖它们。
 升级之后重新执行一次 `./install.sh` 即可（安装脚本会先检查是否已应用）。
 
-如果上游改了 `plugins/platforms/qqbot/adapter.py` 的上下文导致补丁打不上：
+如果上游改了补丁插入点附近的行导致打不上，`install.sh` 会自动依次退让：
+
+1. 严格 `git apply`；
+2. 减小上下文（`git apply -C1 --recount`）；
+3. GNU patch `--fuzz=3`（允许 3 行上下文漂移）。
+
+三步都失败才会报错，并打印「布局 + 版本号」方便提 issue；打补丁前会自动把两个文件备份到
+`~/.hermes/qq-model-picker-backup/`。也可以手动：
 
 ```bash
 cd ~/.hermes/hermes-agent
-git apply --3way /path/to/patches/qqbot-model-picker.patch   # 三方合并，冲突处手动解
+git apply -C1 --recount /path/to/patches/qqbot-model-picker.patch   # 或 --3way 手动解冲突
 ```
 
 ## 兼容性
 
-- 在 **Hermes Agent v0.23.0+607.g981791d**（upstream `981791d9`）上开发并实测
-- 补丁只动两个文件，纯新增函数 + 3 处插入，冲突面很小：
-  - `plugins/platforms/qqbot/keyboards.py`（+85 行）
-  - `plugins/platforms/qqbot/adapter.py`（+145 行）
-- 依赖 `plugins/platforms/qqbot/keyboards.py` 里已有的 `InlineKeyboard` / `INTERACTION_CREATE` 交互链路
+| Hermes | 插件目录 | 补丁 | 状态 |
+|---|---|---|---|
+| v0.23.0+607.g981791d（upstream `981791d9`） | `plugins/platforms/qqbot/` | `qqbot-model-picker.patch` | 开发 + 实测 |
+| v0.18.0（`v2026.7.1-82-g6cffc37b5`） | `gateway/platforms/qqbot/` | `qqbot-model-picker-legacy.patch` | `git apply` + 自检 + 行为测试通过 |
+
+- 补丁只动两个文件，纯新增函数 + 2~3 处插入，冲突面很小：
+  - `keyboards.py`（+75 行）——键盘构建与 `button_data` 解析
+  - `adapter.py`（新版 +145 行；旧版 +207 行，多出的部分是把「发通知」改用旧版自带的
+    `send()`，以及不依赖上游改动的 `c2c`/`dm` 兼容鉴权）
+- 依赖插件已有的 `InlineKeyboard` / `INTERACTION_CREATE` 交互链路
+- 网关侧的 `send_model_picker` 契约在新旧版本都存在，所以补丁只补适配器侧
+  （旧版调用点在 `gateway/slash_commands.py:1458` 与 `:1689`）
 
 ## 已知限制
 

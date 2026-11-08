@@ -164,19 +164,41 @@ model_pick:x|<session_key>                               取消
 
 | 项 | 说明 |
 |---|---|
-| 代码归属 | 只在 `plugins/platforms/qqbot/` 内新增函数与 3 处插入 |
+| 代码归属 | 只在上游的 QQ 插件目录内新增函数与 2~3 处插入（新版 `plugins/platforms/qqbot/`，旧版 `gateway/platforms/qqbot/`） |
 | 网关代码 | 未修改 |
 | 其它平台 | 未修改 |
 | 上游合并 | 已按上游其它适配器（Telegram/Discord/Slack/Matrix）的契约实现，理论上可直接 PR |
 
-补丁规模：`keyboards.py` +85 行、`adapter.py` +145 行。
+补丁规模：`keyboards.py` +75 行；`adapter.py` 新版 +145 行、旧版 +207 行。
 
 ## 10. 实测环境
 
 - Hermes Agent `v0.23.0+607.g981791d`（upstream `981791d9`），Linux，`systemctl --user` 托管网关
+- 旧版布局：Hermes Agent `v0.18.0`（`6cffc37b5`，插件在 `gateway/platforms/qqbot/`），
+  用 legacy 补丁验证（见 §11）
 - 平台：QQ Bot（C2C）+ 元宝
 - 验证方式：
   1. 在干净 checkout 上 `git apply` → 通过；
   2. 导入 `QQAdapter`，确认 `send_model_picker` 存在；
   3. 构造键盘 payload，确认 ≤5 行、`button_data` 往返解析正确；
   4. 重启网关，QQ 侧 `/model` 实际点击验证。
+
+## 11. 双布局兼容（v0.2.0）
+
+上游在两个世代里放的位置不同，所以不存在"一份补丁通吃"的写法（`git apply` 需要目标文件存在）：
+
+| 世代 | 插件目录 | 使用的补丁 | 契约位置 |
+|---|---|---|---|
+| v0.20+ | `plugins/platforms/qqbot/` | `patches/qqbot-model-picker.patch` | 同目录内相对导入 |
+| v0.18.x 及更早 | `gateway/platforms/qqbot/` | `patches/qqbot-model-picker-legacy.patch` | `gateway/slash_commands.py:1458`、`:1689` |
+
+旧版差异与处理：
+
+- **导入**：`from .keyboards import ...` → `from gateway.platforms.qqbot.keyboards import ...`
+- **发消息**：旧版没有 `_text_sender()`，`_send_model_picker_notice()` 改用自带的 `await self.send(...)`
+- **鉴权**：旧版 `_is_authorized_interaction_for_session()` 只认 `c2c`，新版网关发的是 `dm`。
+  旧版补丁**不改上游共享函数**，而是新增 `_is_authorized_model_pick()`：先调上游函数，
+  再放宽私聊键的两种拼写——这样 `hermes update` 不会和上游的同名修复打架
+- **`send_model_picker` 契约**：两个世代都有，因此都不需要动网关代码
+
+`install.sh` 的布局探测与三级退让（严格 → `-C1` → GNU patch fuzz）见 README「升级注意」。

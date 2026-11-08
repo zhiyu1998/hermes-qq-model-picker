@@ -1,0 +1,316 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 300a935..48954a5 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -129,9 +129,11 @@ from gateway.platforms.qqbot.keyboards import (
+     InlineKeyboard,
+     InteractionEvent,
+     build_approval_keyboard,
++    build_model_picker_keyboard,
+     build_update_prompt_keyboard,
+     parse_approval_button_data,
+     parse_interaction_event,
++    parse_model_pick_button_data,
+     parse_update_prompt_button_data,
+ )
+ 
+@@ -1174,11 +1176,216 @@ class QQAdapter(BasePlatformAdapter):
+             self._write_update_response(update_answer, event.operator_openid)
+             return
+ 
++        model_pick = parse_model_pick_button_data(button_data)
++        if model_pick is not None:
++            kind, fields = model_pick
++            await self._handle_model_pick_interaction(event, kind, fields)
++            return
++
+         logger.debug(
+             "[%s] Unrecognised button_data %r from interaction %s",
+             self._log_tag, button_data, event.id,
+         )
+ 
++    # ── /model picker (cross-adapter contract: gateway calls send_model_picker) ──
++
++    _MODEL_PICKER_PAGE_SIZE = 8
++
++    def _model_picker_store(self) -> dict:
++        """Pending pickers keyed by session_key (one live picker per chat)."""
++        store = getattr(self, "_model_picker_pending", None)
++        if not isinstance(store, dict):
++            store = {}
++            self._model_picker_pending = store
++        return store
++
++    _MODEL_BUTTON_LABEL_MAX = 20
++
++    @staticmethod
++    def _provider_label(prov) -> str:
++        """Human-readable provider label ("OpenRouter", "Xiaomi MiMo", "custom")."""
++        name = str(prov.get("name") or "").strip()
++        if name:
++            return name.split("(")[0].strip() or name
++        return str(prov.get("slug") or "").strip() or "?"
++
++    @staticmethod
++    def _model_picker_items(providers, current_provider: str = "",
++                            current_model: str = "") -> list:
++        """Flatten picker providers into ``(provider_slug, provider_label, model_id)``.
++
++        The active provider comes first (QQ shows only one keyboard page at a time,
++        so a 58-model catalog must not bury the route in use), then any provider
++        offering the current model, then the rest.
++        """
++        def rank(prov) -> int:
++            if prov.get("is_current"):
++                return 0
++            slug = str(prov.get("slug") or "")
++            models = [str(m) for m in (prov.get("models") or [])]
++            # A named custom provider is listed as "custom:gua" while config says
++            # "custom" — both name the same endpoint, so compare unscoped slugs too.
++            if current_provider and (slug == current_provider
++                                     or slug.split(":")[0] == current_provider.split(":")[0]):
++                return 0
++            if current_model and current_model in models:
++                return 1
++            return 2
++
++        items: list = []
++        seen: set = set()
++        for prov in sorted(providers or [], key=rank):
++            slug = str(prov.get("slug") or "")
++            label = QQAdapter._provider_label(prov)
++            for raw in (prov.get("models") or []):
++                model_id = str(raw)
++                key = (slug, model_id)
++                if key in seen:
++                    continue
++                seen.add(key)
++                items.append((slug, label, model_id))
++        return items
++
++    @staticmethod
++    def _resolve_current_item(items, current_provider: str,
++                              current_model: str) -> tuple:
++        """Map the gateway's current route onto a picker item ``(slug, label, model)``.
++
++        ``current_provider`` comes from config ("custom") but the item slug of a named
++        custom provider is scoped ("custom:gua"); matching the exact slug alone would
++        leave the current row unmarked. Prefer the same model on the same provider,
++        then the same model anywhere, then the same provider with any model.
++        """
++        want = (current_provider or "").split(":")[0]
++
++        def same_provider(slug: str) -> bool:
++            return bool(want) and slug.split(":")[0] == want
++
++        for slug, label, model in items:
++            if model == current_model and (slug == current_provider or same_provider(slug)):
++                return slug, label, model
++        for slug, label, model in items:
++            if model == current_model:
++                return slug, label, model
++        for slug, label, _model in items:
++            if same_provider(slug):
++                return slug, label, current_model
++        return current_provider, current_provider or "?", current_model
++
++    def _is_authorized_model_pick(self, event: InteractionEvent,
++                                  session_key: str) -> bool:
++        """Authorize a /model pick click against the session key + operator.
++
++        Delegates to :meth:`_is_authorized_interaction_for_session`, then accepts
++        the 1:1 chat spelling of either generation: older gateways put ``c2c`` in
++        the session key, newer ones ``dm``. Matching only one spelling would
++        silently drop every button click in a private chat.
++        """
++        if self._is_authorized_interaction_for_session(event, session_key):
++            return True
++        parsed = self._parse_gateway_session_key(session_key) or {}
++        if parsed.get("platform") != "qqbot":
++            return False
++        if parsed.get("chat_type", "") not in {"c2c", "dm"}:
++            return False
++        operator = str(event.operator_openid or "").strip()
++        chat_id = str(parsed.get("chat_id", "")).strip()
++        return bool(operator) and bool(chat_id) and operator == chat_id
++
++    async def _send_model_picker_page(self, chat_id: str, key: str,
++                                      page: int) -> SendResult:
++        state = self._model_picker_store().get(key) or {}
++        items = state.get("items") or []
++        if not items:
++            return SendResult(success=False, error="no models to pick", retryable=False)
++        size = self._MODEL_PICKER_PAGE_SIZE
++        total_pages = max(1, (len(items) + size - 1) // size)
++        page = max(0, min(int(page), total_pages - 1))
++        state["page"] = page
++        current_provider, current_model = state.get("current") or ("", "")
++        current_label = state.get("current_label") or current_provider or "?"
++        start = page * size
++        window = items[start:start + size]
++
++        # The legend carries the full provider + model id, because a QQ button label
++        # is too narrow to fit both legibly; the buttons just carry the index.
++        lines = [f"🧠 **选择模型**（第 {page + 1}/{total_pages} 页）", "",
++                 f"当前：{current_label} · `{current_model or '未知'}`", ""]
++        for offset, (slug, prov_label, model_id) in enumerate(window):
++            mark = " ✓" if (slug, model_id) == (current_provider, current_model) else ""
++            lines.append(f"{start + offset + 1}. {prov_label} · `{model_id}`{mark}")
++        lines += ["", "点下面的数字按钮切换："]
++        text = "\n".join(lines)
++
++        keyboard = build_model_picker_keyboard(
++            items, key, current=(current_provider, current_model),
++            page=page, page_size=size)
++        return await self.send_with_keyboard(
++            chat_id, text, keyboard, reply_to=self._last_msg_id.get(chat_id))
++
++    async def send_model_picker(
++        self, chat_id: str, providers: list, current_model: str = "",
++        current_provider: str = "", session_key: str = "", on_model_selected=None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Inline-keyboard /model picker: tap a model button to switch (QQ 5-row limit)."""
++        del metadata
++        try:
++            items = self._model_picker_items(providers, current_provider, current_model)
++            if not items:
++                return SendResult(success=False, error="no models to pick", retryable=False)
++            key = session_key or chat_id
++            cur_slug, cur_label, cur_model = self._resolve_current_item(
++                items, current_provider, current_model)
++            self._model_picker_store()[key] = {
++                "items": items, "on_model_selected": on_model_selected, "chat_id": chat_id,
++                "current": (cur_slug, cur_model), "current_label": cur_label, "page": 0,
++            }
++            return await self._send_model_picker_page(chat_id, key, 0)
++        except Exception as exc:
++            logger.error("[%s] send_model_picker failed: %s", self._log_tag, exc, exc_info=True)
++            return SendResult(success=False, error=str(exc) or type(exc).__name__)
++
++    async def _send_model_picker_notice(self, chat_id: str, text: str) -> None:
++        try:
++            await self.send(chat_id, text[: self.MAX_MESSAGE_LENGTH])
++        except Exception as exc:
++            logger.warning("[%s] model picker notice failed: %s", self._log_tag, exc)
++
++    async def _handle_model_pick_interaction(self, event: InteractionEvent, kind: str,
++                                             fields: tuple) -> None:
++        """Dispatch a /model picker button click: select / page / cancel."""
++        session_key = fields[-1]
++        store = self._model_picker_store()
++        state = store.get(session_key)
++        if state is None:
++            logger.info("[%s] Model picker state gone for session %s", self._log_tag, session_key)
++            return
++        if not self._is_authorized_model_pick(event, session_key):
++            logger.warning("[%s] Rejected unauthorized model pick for session %s (operator=%s)",
++                           self._log_tag, session_key, event.operator_openid)
++            return
++        chat_id = state.get("chat_id") or event.user_openid
++        if kind == "x":
++            store.pop(session_key, None)
++            await self._send_model_picker_notice(chat_id, "已取消模型切换。")
++            return
++        if kind == "p":
++            await self._send_model_picker_page(chat_id, session_key, int(fields[0]))
++            return
++        provider, model = fields[0], fields[1]
++        callback = state.get("on_model_selected")
++        store.pop(session_key, None)
++        if callback is None:
++            await self._send_model_picker_notice(chat_id, "选择器已失效，请重新发送 /model。")
++            return
++        try:
++            reply = await callback(chat_id, model, provider)
++        except Exception as exc:
++            logger.error("[%s] Model picker switch failed: %s", self._log_tag, exc, exc_info=True)
++            reply = f"❌ 切换模型失败：{exc}"
++        await self._send_model_picker_notice(chat_id, reply or "✅ 已切换模型。")
++
+     @staticmethod
+     def _write_update_response(answer: str, operator: str = "") -> None:
+         """Atomically write the update-prompt answer to ``.update_response``.
+diff --git a/gateway/platforms/qqbot/keyboards.py b/gateway/platforms/qqbot/keyboards.py
+index 19fd36e..cf80f03 100644
+--- a/gateway/platforms/qqbot/keyboards.py
++++ b/gateway/platforms/qqbot/keyboards.py
+@@ -471,3 +471,78 @@ def parse_interaction_event(raw: Dict[str, Any]) -> InteractionEvent:
+         button_id=str(resolved.get("button_id", "")),
+         resolver_user_id=str(resolved.get("user_id", "")),
+     )
++
++
++# ── /model picker ────────────────────────────────────────────────────────────
++MODEL_PICK_PREFIX = "model_pick:"
++_MODEL_LABEL_MAX = 20  # QQ inline-keyboard button label limit
++_MODEL_PICK_RE = re.compile(r"^model_pick:([mpx])\|(.+)$")
++
++
++def parse_model_pick_button_data(button_data: str) -> Optional[tuple[str, tuple[str, ...]]]:
++    """Parse a /model picker ``button_data`` into ``(kind, fields)``.
++
++    Kinds: ``m`` select → ``("m", (provider, model, session_key))``;
++    ``p`` page → ``("p", (page, session_key))``; ``x`` cancel → ``("x", (session_key,))``.
++    """
++    m = _MODEL_PICK_RE.match(button_data or "")
++    if not m:
++        return None
++    kind, rest = m.group(1), m.group(2)
++    parts = tuple(rest.split("|"))
++    if kind == "m" and len(parts) == 3:
++        return kind, parts
++    if kind == "p" and len(parts) == 2 and parts[0].isdigit():
++        return kind, parts
++    if kind == "x" and len(parts) == 1:
++        return kind, parts
++    return None
++
++
++def _model_pick_button(btn_id: str, label: str, data: str, *, style: int = 1,
++                       visited: str = "已选择") -> KeyboardButton:
++    return KeyboardButton(
++        id=btn_id, group_id="model_pick",
++        action=KeyboardButtonAction(type=1, data=data),
++        render_data=KeyboardButtonRenderData(label=label, visited_label=visited, style=style))
++
++
++def build_model_picker_keyboard(items: list, session_key: str, *, current: tuple = ("", ""),
++                                page: int = 0, page_size: int = 8) -> InlineKeyboard:
++    """Build the /model picker keyboard.
++
++    QQ allows at most 5 rows per keyboard, so a page shows ``page_size`` models at
++    two per row plus one action row (``下一页`` when more remain, always ``取消``).
++    *items* holds ``(provider_slug, provider_label, model_id)`` triples.
++
++    A button label is narrow, so it carries only ``<index>. <short model>`` — the
++    message body renders the full ``provider · model`` legend for those indexes.
++    """
++    start = page * page_size
++    window = items[start:start + page_size]
++    rows: list[KeyboardRow] = []
++    for i in range(0, len(window), 2):
++        buttons = []
++        for offset, (provider, _provider_label, model) in enumerate(window[i:i + 2]):
++            idx = start + i + offset
++            is_current = (provider, model) == (current[0], current[1])
++            number = str(idx + 1)
++            budget = _MODEL_LABEL_MAX - len(number) - 2 - (1 if is_current else 0)  # "12. " (+"✓")
++            short = model.split("/")[-1] if "/" in model else model
++            if len(short) > budget:
++                short = short[:max(budget - 1, 4)] + "…"
++            label = f"{number}. {short}"
++            if is_current:
++                label = "✓" + label
++            data = f"{MODEL_PICK_PREFIX}m|{provider}|{model}|{session_key}"
++            buttons.append(_model_pick_button(f"m{idx}", label[:_MODEL_LABEL_MAX], data))
++        rows.append(KeyboardRow(buttons=buttons))
++    actions = []
++    if start + page_size < len(items):
++        actions.append(_model_pick_button(
++            "next", "下一页 ▸", f"{MODEL_PICK_PREFIX}p|{page + 1}|{session_key}",
++            style=1, visited="下一页"))
++    actions.append(_model_pick_button(
++        "cancel", "取消", f"{MODEL_PICK_PREFIX}x|{session_key}", style=0, visited="已取消"))
++    rows.append(KeyboardRow(buttons=actions))
++    return InlineKeyboard(content=KeyboardContent(rows=rows[:5]))

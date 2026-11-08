@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.0] - 2026-11-08
+
+### Added
+- **支持旧版 Hermes 布局**：上游在 v0.20 之前把 QQ 插件放在 `gateway/platforms/qqbot/`，
+  之后才搬到 `plugins/platforms/qqbot/`。现在 `install.sh` / `uninstall.sh` 都会先探测目录，
+  自动选择对应补丁：
+  - `plugins/platforms/qqbot/` → `patches/qqbot-model-picker.patch`
+  - `gateway/platforms/qqbot/` → `patches/qqbot-model-picker-legacy.patch`（新增）
+- 新增 `patches/qqbot-model-picker-legacy.patch`（针对 v0.18.0 `6cffc37b5` 生成）：
+  - 导入改为绝对路径 `from gateway.platforms.qqbot.keyboards import ...`
+  - 通知改用旧版自带的 `send()`（旧版没有 `_text_sender`）
+  - 新增 `_is_authorized_model_pick()`：先走上游的 `_is_authorized_interaction_for_session()`，
+    再放宽私聊键的两种拼写（`c2c` / `dm`），**不改上游共享函数**，避免升级冲突
+
+### Changed
+- `install.sh` 打补丁前把两个文件备份到 `~/.hermes/qq-model-picker-backup/`（`*.preinstall.<stamp>`）
+- 打补丁改为三级退让：严格 `git apply` → `git apply -C1 --recount` → GNU patch `--fuzz=3`，
+  只有全部失败才报错，并打印「布局 + 版本号」
+- 自检（self-check）路径改为按探测结果动态拼接；`QQAdapter` 的导入检查会区分
+  「模块路径不对」与「缺第三方依赖」（后者只在输出里注明 missing dep，不算失败）
+- `uninstall.sh` 同样自动识别布局；未找到插件时直接返回 0 而不是报错
+
+### Verified
+- v0.23.0（`981791d9`，`plugins/` 布局）：补丁 `git apply` 通过，自检通过
+- v0.18.0（`6cffc37b5`，`gateway/` 布局）：`git apply` 通过、自检通过；另用 stub 适配器跑通
+  「构建键盘 → 翻页 → 选择 → 鉴权拒绝 → 取消」全流程
+- 上下文漂移场景（人为在插入点旁加行）：`-C1` / fuzz 兜底生效，上游新增行保留、结果仍可解析
+
 ## [0.1.2] - 2026-11-07
 
 ### Fixed

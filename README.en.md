@@ -3,6 +3,9 @@
 [中文](README.md) | **English**
 
 > A **clickable model picker** for the `/model` command of the [Hermes Agent](https://github.com/NousResearch/hermes-agent) **QQ bot**.
+>
+> Supports **v0.18.x** (plugin under `gateway/platforms/qqbot/`) and **v0.20+** (plugin under
+> `plugins/platforms/qqbot/`); the installer detects the layout and picks the right patch.
 
 Send `/model` in QQ and instead of getting "here is a text list, now type
 `/model <model> --provider <slug>` yourself", you get a **card with buttons**:
@@ -83,6 +86,14 @@ use it) — it just was never wired up to `/model`. This project fills that gap.
 
 ## Install
 
+`install.sh` probes the checkout for the QQ plugin directory and picks the matching patch,
+so **both the old and the new upstream layout work**:
+
+| Detected directory | Patch used | Hermes |
+|---|---|---|
+| `plugins/platforms/qqbot/` | `patches/qqbot-model-picker.patch` | newer builds (v0.20+, incl. v0.23.0) |
+| `gateway/platforms/qqbot/` | `patches/qqbot-model-picker-legacy.patch` | older builds (v0.18.x and earlier) |
+
 ### Option 1: one-liner (repository already cloned)
 
 ```bash
@@ -92,11 +103,24 @@ cd hermes-qq-model-picker
 ./install.sh --restart       # apply patch + restart gateway
 ```
 
+The script prints the layout and patch it selected, e.g.:
+
+```text
+= layout: gateway/platforms/qqbot
+= patch:  patches/qqbot-model-picker-legacy.patch
+```
+
 ### Option 2: manual
 
 ```bash
 cd ~/.hermes/hermes-agent
+
+# newer layout (plugin under plugins/platforms/qqbot/)
 git apply /path/to/patches/qqbot-model-picker.patch
+
+# older layout (plugin under gateway/platforms/qqbot/)
+git apply /path/to/patches/qqbot-model-picker-legacy.patch
+
 hermes gateway restart        # or: systemctl --user restart hermes-gateway.service
 ```
 
@@ -107,8 +131,12 @@ restart with `hermes gateway restart` (or the equivalent service command).
 
 ```bash
 cd ~/.hermes/hermes-agent
+
+# newer layout
 venv/bin/python -c "from plugins.platforms.qqbot.adapter import QQAdapter; print(hasattr(QQAdapter,'send_model_picker'))"
-# expected output: True
+# older layout
+venv/bin/python -c "from gateway.platforms.qqbot.adapter import QQAdapter; print(hasattr(QQAdapter,'send_model_picker'))"
+# both should print True
 ```
 
 Then send `/model` in QQ and you should receive a card with buttons right away.
@@ -116,7 +144,7 @@ Then send `/model` in QQ and you should receive a card with buttons right away.
 ## Uninstall / rollback
 
 ```bash
-./uninstall.sh              # git checkout to restore the two files
+./uninstall.sh              # git checkout to restore the two files (layout auto-detected)
 ./uninstall.sh --restart    # restore and restart the gateway
 ```
 
@@ -126,23 +154,37 @@ The patch modifies **plugin files inside the hermes-agent checkout**, and `herme
 overwrites them with the upstream versions. Just re-run `./install.sh` after an upgrade
 (the installer first checks whether the patch is already applied).
 
-If upstream changed the context around `plugins/platforms/qqbot/adapter.py` so the patch no
-longer applies:
+If upstream changed lines near an insertion point, `install.sh` degrades gracefully:
+
+1. strict `git apply`;
+2. reduced context (`git apply -C1 --recount`);
+3. GNU patch with `--fuzz=3` (tolerates 3 lines of drifted context).
+
+Only if all three fail does it report an error, printing the layout and version for an issue
+report. The two files are backed up to `~/.hermes/qq-model-picker-backup/` before patching.
+Manual alternative:
 
 ```bash
 cd ~/.hermes/hermes-agent
-git apply --3way /path/to/patches/qqbot-model-picker.patch   # three-way merge, resolve conflicts by hand
+git apply -C1 --recount /path/to/patches/qqbot-model-picker.patch   # or --3way and resolve by hand
 ```
 
 ## Compatibility
 
-- Developed and tested against **Hermes Agent v0.23.0+607.g981791d** (upstream `981791d9`)
-- The patch touches only two files, with purely additive functions + 3 insertion points, so
+| Hermes | Plugin directory | Patch | Status |
+|---|---|---|---|
+| v0.23.0+607.g981791d (upstream `981791d9`) | `plugins/platforms/qqbot/` | `qqbot-model-picker.patch` | developed + tested |
+| v0.18.0 (`v2026.7.1-82-g6cffc37b5`) | `gateway/platforms/qqbot/` | `qqbot-model-picker-legacy.patch` | `git apply` + self-check + behavioural test pass |
+
+- The patch touches only two files, with purely additive functions + 2–3 insertion points, so
   the conflict surface is small:
-  - `plugins/platforms/qqbot/keyboards.py` (+85 lines)
-  - `plugins/platforms/qqbot/adapter.py` (+145 lines)
-- Relies on the existing `InlineKeyboard` / `INTERACTION_CREATE` interaction path in
-  `plugins/platforms/qqbot/keyboards.py`
+  - `keyboards.py` (+75 lines) — keyboard builder and `button_data` parsing
+  - `adapter.py` (+145 lines on the new layout; +207 on the legacy one — the extra lines send
+    notices through the older build's own `send()` and authorize `c2c`/`dm` without patching
+    upstream's shared helper)
+- Relies on the existing `InlineKeyboard` / `INTERACTION_CREATE` interaction path
+- The gateway-side `send_model_picker` contract exists in both generations, so only the
+  adapter side is patched (old build: called from `gateway/slash_commands.py:1458` / `:1689`)
 
 ## Known limitations
 
